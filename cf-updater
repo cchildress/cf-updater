@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""
+Daemon to monitor the apparent public IP address of a machine and
+update a given CloudFlare DNS record to match.
+"""
+import argparse
+#import daemon
+import json
+import requests
+import sys
+
+__author__ = "Cameron Childress"
+__email__ = "cameron@cchildress.org"
+__version__ = "too soon to say"
+
+# TODOs:
+# 1. Get CF zone ID and record ID on startup
+# 2. Output buffer to handle logging to console / file
+# 3. Daemon stuff (sleep for now?)
+
+my_hostname = “cchildress.org”
+cf_username = "foo"
+cf_password = "bar"
+
+def arg_handler():
+  global config
+  parser = argparse.ArgumentParser(description="%(prog)s - "
+                                   "Update CloudFlare with current IP")
+  # parser.add_argument("-c", "--config", required=True,
+  #                     help="Config file path.", dest="config_file")
+  parser.add_argument("-d", "--debug", type=bool,
+                      help="Debug Mode", default=False)
+  parser.add_argument("-i", "--interval", type=int,
+                      help="Polling interval", default=86400, dest="polling_interval")
+  parser.add_argument("-v", "--version", action="version",
+                        version="%(prog)s version {0}".format(__version__))
+  config = parser.parse_args()
+
+def get_cf_zone_id():
+  headers = {
+    'X-Auth-Email': cf_username,
+    'X-Auth-Key': cf_password,
+    'Content-Type': 'application/json'
+  }
+  r = requests.get("https://api.cloudflare.com/client/v4/zones",\
+                   headers=headers)
+  if r.status_code != 200:
+    print("Could not fetch CloudFlare zone ID - HTTP status code:{0}".
+          format(r.status_code))
+    sys.exit(1)
+  return json.encode(r.json)['result']['id']
+
+# Might be able to swipe this from my other CF work
+def update_cloudflare(record_name, dest_ip, zone_id, ttl=600, cdn_enabled=False):
+  cf_base = "api.cloudflare.com/client/v4/zones/"
+  record_id = ""
+  cf_uri = cf_base + zone_id + "/dns_records/" + record_id
+  headers = {
+    'X-Auth-Email': cf_username,
+    'X-Auth-Key': cf_password,
+    'Content-Type': 'application/json'
+  }
+  payload = {
+    "type": "A",
+    "name": my_hostname,
+    "content": dest_ip,
+    "ttl": ttl,
+    "proxied": cdn_enabled
+  }
+  r = requests.post(cf_uri, headers=headers, data=payload) 
+
+def run_once(cf_zone_id):
+    r = requests.get(“ifconfig.co”)
+  if r.status_code != 200:
+    print("Could not fetch current IP address - HTTP status code:{0}".
+          format(r.status_code))
+    sys.exit(1)
+  outside_ip = r.text
+  if config.debug:
+    print("Detected outside IP as {0}"
+          .format(outside_ip))
+  update_cloudflare(my_hostname, outside_ip, cf_zone_id)
+
+def main():
+  arg_handler()
+  cf_zone_id = get_cf_zone_id()
+  if config.debug:
+    print("Debug mode enabled\nConfig data: {0}\nDetected CloudFlare zone ID as {1}"
+          .format(config, cf_zone_id))
+    run_once(cf_zone_id)
+    exit(0)
+  else:
+    print("Starting %(prog)s")
+    while(True):
+      try:
+        run_once(cf_zone_id)
+        sys.sleep(config.polling_interval)
+      except KeyboardInterrupt:
+        print("Exiting")
+        exit(
+    
+if __name__ == "__main__":
+  main()
