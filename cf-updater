@@ -4,100 +4,165 @@ Daemon to monitor the apparent public IP address of a machine and
 update a given CloudFlare DNS record to match.
 """
 import argparse
-#import daemon
+import configparser
 import json
 import requests
+import signal
 import sys
 
 __author__ = "Cameron Childress"
-__email__ = "cameron@cchildress.org"
+__email__ = "python@cchildress.org"
 __version__ = "too soon to say"
 
 # TODOs:
-# 1. Get CF zone ID and record ID on startup
-# 2. Output buffer to handle logging to console / file
-# 3. Daemon stuff (sleep for now?)
+# 1. Output buffer to handle logging to console / file
+# 2. Daemon stuff (sleep for now?)
+# 3. Figure out getting a local interface's address directly without crazy dependencies
 
-my_hostname = “cchildress.org”
-cf_username = "foo"
-cf_password = "bar"
 
 def arg_handler():
-  global config
-  parser = argparse.ArgumentParser(description="%(prog)s - "
-                                   "Update CloudFlare with current IP")
-  # parser.add_argument("-c", "--config", required=True,
-  #                     help="Config file path.", dest="config_file")
-  parser.add_argument("-d", "--debug", type=bool,
-                      help="Debug Mode", default=False)
-  parser.add_argument("-i", "--interval", type=int,
-                      help="Polling interval", default=86400, dest="polling_interval")
-  parser.add_argument("-v", "--version", action="version",
+    global config_runtime
+    parser = argparse.ArgumentParser(description="%(prog)s - "
+                                     "Update CloudFlare with current IP")
+    parser.add_argument("-c", "--config", help="Config file path.",
+                        default="./config.ini", dest="config_file")
+    parser.add_argument("-d", "--debug", action="store_true", help="Debug Mode")
+    parser.add_argument("-v", "--version", action="version",
                         version="%(prog)s version {0}".format(__version__))
-  config = parser.parse_args()
+    config_runtime = parser.parse_args()
+
+
+def cf_api_handler(api_path):
+    headers = {
+        'X-Auth-Email': config_file['cloudflare']['username'],
+        'X-Auth-Key': config_file['cloudflare']['auth_token'],
+        'Content-Type': 'application/json'
+    }
+    r = requests.get("https://api.cloudflare.com/client/v4/{0}".format(api_path),
+                     headers=headers)
+    if r.status_code != 200:
+        print("CloudFlare API failure - HTTP status code:{0}"
+              .format(r.status_code))
+        if config_runtime.debug:
+            print("CloudFlare URI: {0}\nFailure text: '{1}'"
+                  .format("https://api.cloudflare.com/client/v4/{0}"
+                  .format(api_path), r.text))
+        sys.exit(1)
+    return r.json()
+
 
 def get_cf_zone_id():
-  headers = {
-    'X-Auth-Email': cf_username,
-    'X-Auth-Key': cf_password,
-    'Content-Type': 'application/json'
-  }
-  r = requests.get("https://api.cloudflare.com/client/v4/zones",\
-                   headers=headers)
-  if r.status_code != 200:
-    print("Could not fetch CloudFlare zone ID - HTTP status code:{0}".
-          format(r.status_code))
-    sys.exit(1)
-  return json.encode(r.json)['result']['id']
+    return cf_api_handler('zones')['result'][0]['id']
 
-# Might be able to swipe this from my other CF work
-def update_cloudflare(record_name, dest_ip, zone_id, ttl=600, cdn_enabled=False):
-  cf_base = "api.cloudflare.com/client/v4/zones/"
-  record_id = ""
-  cf_uri = cf_base + zone_id + "/dns_records/" + record_id
-  headers = {
-    'X-Auth-Email': cf_username,
-    'X-Auth-Key': cf_password,
-    'Content-Type': 'application/json'
-  }
-  payload = {
-    "type": "A",
-    "name": my_hostname,
-    "content": dest_ip,
-    "ttl": ttl,
-    "proxied": cdn_enabled
-  }
-  r = requests.post(cf_uri, headers=headers, data=payload) 
 
-def run_once(cf_zone_id):
-    r = requests.get(“ifconfig.co”)
-  if r.status_code != 200:
-    print("Could not fetch current IP address - HTTP status code:{0}".
-          format(r.status_code))
-    sys.exit(1)
-  outside_ip = r.text
-  if config.debug:
-    print("Detected outside IP as {0}"
-          .format(outside_ip))
-  update_cloudflare(my_hostname, outside_ip, cf_zone_id)
+def get_current_cf_record_info(zone_id):
+    cf = cf_api_handler("zones/{0}/dns_records".format(zone_id))
+    for record in cf['result']:
+        if record['name'] == config_file['cloudflare']['hostname']:
+            if record['type'] == 'A':
+                return record['id'], record['content']
+    return None
+
+
+def get_current_ip():
+    if config_file['default']['polling_method'] == 'external':
+        return get_current_ip_external()
+    elif config_file['default']['polling_method'] == 'interface':
+        return get_current_ip_interface()
+    else:
+        print("polling_method in {0} is invalid - please set it to either 'external' or 'interface'"
+              .format(config_runtime.config_file))
+        sys.exit(1)
+
+def get_current_ip_external():
+    r = requests.get(config_file['default']['polling_address'])
+    if r.status_code != 200:
+        print("Could not fetch current IP address - HTTP status code:{0}".
+              format(r.status_code))
+        sys.exit(1)
+    return r.text.rstrip()
+
+
+# TODO: this is very broken
+def get_current_ip_interface():
+    import socket
+    import fcntl
+    import struct
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    return socket.inet_ntoa(fcntl.ioctl(
+        s.fileno(),
+        0x8915,  # SIOCGIFADDR
+        struct.pack('256s', bytes(config_file['default']['polling_interface'][:15], 'utf-8'))
+    )[20:24])
+
+
+def read_config_file():
+    global config_file
+    config_file = configparser.ConfigParser()
+    config_file.read(config_runtime.config_file)
+
+
+def update_cloudflare(zone_id, record_id, dest_ip, ttl=600, cdn_enabled=False):
+    cf_base = "https://api.cloudflare.com/client/v4/zones/"
+    cf_uri = cf_base + zone_id + "/dns_records/" + record_id
+    headers = {
+        'X-Auth-Email': config_file['cloudflare']['username'],
+        'X-Auth-Key': config_file['cloudflare']['auth_token'],
+        'Content-Type': 'application/json'
+    }
+    payload = {
+        "type": "A",
+        "name": config_file['cloudflare']['hostname'],
+        "content": dest_ip,
+        "ttl": ttl,
+        "proxied": cdn_enabled
+    }
+    r = requests.put(cf_uri, headers=headers, data=json.dumps(payload))
+    if r.status_code != 200:
+        print("CloudFlare update failre - HTTP status code:{0}"
+              .format(r.status_code))
+        if config_runtime.debug:
+            print("CloudFlare URI: {0}\nFailure text: '{1}'"
+                  .format(cf_uri, r.text))
+        sys.exit(1)
+    _, new_record_value = get_current_cf_record_info(zone_id)
+    if new_record_value == dest_ip:
+        print("CloudFlare DNS for {0} updated successfully to {1}"
+              .format(config_file['cloudflare']['hostname'], dest_ip))
+
 
 def main():
-  arg_handler()
-  cf_zone_id = get_cf_zone_id()
-  if config.debug:
-    print("Debug mode enabled\nConfig data: {0}\nDetected CloudFlare zone ID as {1}"
-          .format(config, cf_zone_id))
-    run_once(cf_zone_id)
-    exit(0)
-  else:
-    print("Starting %(prog)s")
-    while(True):
-      try:
-        run_once(cf_zone_id)
-        sys.sleep(config.polling_interval)
-      except KeyboardInterrupt:
-        print("Exiting")
-        exit(
-    
+    arg_handler()
+    read_config_file()
+    if config_runtime.debug:
+        print("Debug mode enabled.")
+        current_ip = get_current_ip()
+        cf_zone_id = get_cf_zone_id()
+        cf_record_id, cf_record_value = get_current_cf_record_info(cf_zone_id)
+        print("Detected current ip as {0}".format(current_ip))
+        print("Detected CloudFlare zone ID as {0}".format(cf_zone_id))
+        print("Detected CloudFlare record ID for hosname {0} as {1}"
+              .format(config_file['cloudflare']['hostname'], cf_record_id))
+        print("{0} currently points at {1}"
+              .format(config_file['cloudflare']['hostname'], cf_record_value))
+        if current_ip != cf_record_value:
+            print("CloudFlare DNS does not match current IP - updating.")
+            update_cloudflare(cf_zone_id, cf_record_id, current_ip)
+        else:
+            print("CloudFlare DNS is up to date - nothing to do here.")
+        exit(0)
+    else:
+        print("Starting {}".format(sys.argv[0]))
+        signal.signal(signal.SIGHUP, read_config_file)
+        signal.pause()
+
+        # while(True):
+        #     try:
+        #         run_once(cf_zone_id)
+        #         sys.sleep(config.polling_interval)
+        #     except KeyboardInterrupt:
+        #         print("Exiting")
+        #         exit(0)
+
 if __name__ == "__main__":
-  main()
+    main()
