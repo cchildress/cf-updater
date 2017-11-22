@@ -5,31 +5,33 @@ update a given CloudFlare DNS record to match.
 """
 import argparse
 import configparser
+import fcntl
 import json
+import os
 import requests
 import signal
+import socket
+import struct
 import sys
+import time
+from logger import Logger
 
 __author__ = "Cameron Childress"
 __email__ = "python@cchildress.org"
 __version__ = "too soon to say"
 
-# TODOs:
-# 1. Output buffer to handle logging to console / file
-# 2. Daemon stuff (sleep for now?)
-# 3. Figure out getting a local interface's address directly without crazy dependencies
-
 
 def arg_handler():
     global config_runtime
-    parser = argparse.ArgumentParser(description="%(prog)s - "
-                                     "Update CloudFlare with current IP")
-    parser.add_argument("-c", "--config", help="Config file path.",
-                        default="./config.ini", dest="config_file")
-    parser.add_argument("-d", "--debug", action="store_true", help="Debug Mode")
-    parser.add_argument("-v", "--version", action="version",
-                        version="%(prog)s version {0}".format(__version__))
+    parser = argparse.ArgumentParser(description="%(prog)s - Update CloudFlare with current IP")
+    parser.add_argument("-c", "--config", help="Config file path.", default="./config.ini", dest="config_file")
+    parser.add_argument("-d", "--debug", action="store_true", help="Debug logging")
+    parser.add_argument("-f", "--foreground", action="store_true", help="Run in foreground")
+    parser.add_argument("-v", "--version", action="version", version="%(prog)s version {0}".format(__version__))
     config_runtime = parser.parse_args()
+    if not os.path.isfile(config_runtime.config_file):
+        print("Could not find config file at {0}".format(config_runtime.config_file))
+        sys.exit(1)
 
 
 def cf_api_handler(api_path):
@@ -38,16 +40,18 @@ def cf_api_handler(api_path):
         'X-Auth-Key': config_file['cloudflare']['auth_token'],
         'Content-Type': 'application/json'
     }
+
     r = requests.get("https://api.cloudflare.com/client/v4/{0}".format(api_path),
                      headers=headers)
     if r.status_code != 200:
-        print("CloudFlare API failure - HTTP status code:{0}"
+        logger.append("CloudFlare API failure - HTTP status code:{0}"
               .format(r.status_code))
         if config_runtime.debug:
-            print("CloudFlare URI: {0}\nFailure text: '{1}'"
+            logger.append("CloudFlare URI: {0}\nFailure text: '{1}'"
                   .format("https://api.cloudflare.com/client/v4/{0}"
                   .format(api_path), r.text))
         sys.exit(1)
+
     return r.json()
 
 
@@ -77,29 +81,43 @@ def get_current_ip():
 def get_current_ip_external():
     r = requests.get(config_file['default']['polling_address'])
     if r.status_code != 200:
-        print("Could not fetch current IP address - HTTP status code:{0}".
+        logger.append("Could not fetch current IP address - HTTP status code:{0}".
               format(r.status_code))
         sys.exit(1)
+
     return r.text.rstrip()
 
 
-# TODO: this is very broken
 def get_current_ip_interface():
-    import socket
-    import fcntl
-    import struct
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    return socket.inet_ntoa(fcntl.ioctl(
-        s.fileno(),
-        0x8915,  # SIOCGIFADDR
-        struct.pack('256s', bytes(config_file['default']['polling_interface'][:15], 'utf-8'))
-    )[20:24])
-
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        return socket.inet_ntoa(fcntl.ioctl(
+            s.fileno(),
+            0x8915,  # SIOCGIFADDR
+            struct.pack('256s', bytes(config_file['default']['polling_interface'][:15], 'utf-8'))
+        )[20:24])
+    except OSError:
+        logger.append("Could not find IP address assigned to {0} - Are you sure it's a real interface?"
+              .format(config_file['default']['polling_interface'][:15]))
+        sys.exit(1)
 
 def read_config_file():
     global config_file
     config_file = configparser.ConfigParser()
     config_file.read(config_runtime.config_file)
+
+
+def signal_handler(signum, frame):
+    global run
+    if signum is signal.SIGHUP:
+        logger.append("Got SIGHUP - reloading")
+        read_config_file()
+    elif signum is signal.SIGINT:
+        logger.append("Got SIGINT - will exit")
+        run = False
+    elif signum is signal.SIGTERM:
+        logger.append("Got SIGTERM - will exit")
+        run = False
 
 
 def update_cloudflare(zone_id, record_id, dest_ip, ttl=600, cdn_enabled=False):
@@ -117,6 +135,7 @@ def update_cloudflare(zone_id, record_id, dest_ip, ttl=600, cdn_enabled=False):
         "ttl": ttl,
         "proxied": cdn_enabled
     }
+
     r = requests.put(cf_uri, headers=headers, data=json.dumps(payload))
     if r.status_code != 200:
         print("CloudFlare update failre - HTTP status code:{0}"
@@ -125,6 +144,7 @@ def update_cloudflare(zone_id, record_id, dest_ip, ttl=600, cdn_enabled=False):
             print("CloudFlare URI: {0}\nFailure text: '{1}'"
                   .format(cf_uri, r.text))
         sys.exit(1)
+
     _, new_record_value = get_current_cf_record_info(zone_id)
     if new_record_value == dest_ip:
         print("CloudFlare DNS for {0} updated successfully to {1}"
@@ -134,35 +154,64 @@ def update_cloudflare(zone_id, record_id, dest_ip, ttl=600, cdn_enabled=False):
 def main():
     arg_handler()
     read_config_file()
+
+    global logger
+    logger = Logger(config_file['default']['log_file'])
+
+    current_ip = get_current_ip()
+    cf_zone_id = get_cf_zone_id()
+    cf_record_id, cf_record_value = get_current_cf_record_info(cf_zone_id)
+
     if config_runtime.debug:
-        print("Debug mode enabled.")
-        current_ip = get_current_ip()
-        cf_zone_id = get_cf_zone_id()
-        cf_record_id, cf_record_value = get_current_cf_record_info(cf_zone_id)
-        print("Detected current ip as {0}".format(current_ip))
-        print("Detected CloudFlare zone ID as {0}".format(cf_zone_id))
-        print("Detected CloudFlare record ID for hosname {0} as {1}"
+        logger.append("Debug mode enabled.")
+        logger.append("Detected current ip as {0}".format(current_ip))
+        logger.append("Detected CloudFlare zone ID as {0}".format(cf_zone_id))
+        logger.append("Detected CloudFlare record ID for hosname {0} as {1}"
               .format(config_file['cloudflare']['hostname'], cf_record_id))
-        print("{0} currently points at {1}"
+        logger.append("{0} currently points at {1}"
               .format(config_file['cloudflare']['hostname'], cf_record_value))
+
+    global run
+    run = True
+
+    if not config_runtime.foreground:
+        # Refuse to start if there is a pid file conflict
+        if os.path.isfile(config_file['default']['pid_file']):
+            print("PID file appears to already exist at {0} - not safe to run"
+                  .format(config_file['default']['pid_file']))
+            sys.exit(1)
+        # Fork to the background
+        pid = os.fork()
+        if pid != 0 :
+            sys.exit(0)
+        with open(config_file['default']['pid_file'], "w") as f:
+            f.write(str(pid))
+        # Signal handlers to manage the daemon
+        signal.signal(signal.SIGHUP, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        print("Starting {}".format(sys.argv[0]))
+
+    while(run):
         if current_ip != cf_record_value:
-            print("CloudFlare DNS does not match current IP - updating.")
+            logger.append("CloudFlare DNS does not match current IP - updating.")
             update_cloudflare(cf_zone_id, cf_record_id, current_ip)
         else:
-            print("CloudFlare DNS is up to date - nothing to do here.")
-        exit(0)
+            logger.append("CloudFlare DNS is up to date - nothing to do here.")
+        # Exit on the first pass if we're in foreground mode
+        if config_runtime.foreground:
+            break
+        time.sleep(int(config_file['default']['polling_interval']))
+        logger.append("Skipping records refresh for now.")
+        # Refresh our records for the next pass
+        # current_ip = get_current_ip()
+        # _, cf_record_value = get_current_cf_record_info(cf_zone_id)
+    if not config_runtime.foreground:
+        os.unlink(config_file['default']['pid_file'])
     else:
-        print("Starting {}".format(sys.argv[0]))
-        signal.signal(signal.SIGHUP, read_config_file)
-        signal.pause()
-
-        # while(True):
-        #     try:
-        #         run_once(cf_zone_id)
-        #         sys.sleep(config.polling_interval)
-        #     except KeyboardInterrupt:
-        #         print("Exiting")
-        #         exit(0)
+        logger.console_out()
+    logger.write_out()
+    exit(0)
 
 if __name__ == "__main__":
     main()
