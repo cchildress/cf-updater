@@ -8,6 +8,8 @@ class Logger(list):
     Inputs:
         target - The filename to which the buffer will be written.
                  Specify this if you plan to use the write_out() method.
+        timestamp - Booleam to enable prefixing entries with a timestamp.
+                    Defaults to False.
     Methods:
     console_out() - Write the current buffer to the running shell.
     write_out() - Write the current buffer to the target specified.
@@ -19,10 +21,11 @@ class Logger(list):
         list.__init__(self)
 
 
-    # TODO: This
-    # def __setitem__(self, k, v):
-    #     if self._timestamp:
-    #         timestr = datetime.now().strftime("%Y%m%d %H:%M:%S")
+    def append(self, item):
+        if self._timestamp:
+            timestr = datetime.now().strftime("%Y%m%d %H:%M:%S ")
+            item = timestr + item
+        super().append(item)
 
 
     def console_out(self):
@@ -32,6 +35,10 @@ class Logger(list):
                     print(line)
             else:
                 print(entry)
+
+
+    def flush(self):
+        self[:] = []
 
 
     def write_out(self):
@@ -44,6 +51,6 @@ class Logger(list):
                             output = '\n'.join([x for x in entry])
                     if isinstance(entry, str):
                         output = entry.rstrip() + '\n'
-                    f.write(bytes(output, 'utf-8'))
+                    f.write(output)
         else:
             print('Cannot write output logs - no target specified.')
