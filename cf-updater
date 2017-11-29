@@ -2,6 +2,10 @@
 """
 Daemon to monitor the apparent public IP address of a machine and
 update a given CloudFlare DNS record to match.
+
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this
+file, You can obtain one at http://mozilla.org/MPL/2.0/.
 """
 import argparse
 import configparser
@@ -24,7 +28,7 @@ __version__ = "1.0.0-rc1-dev"
 def arg_handler():
     global config_runtime
     parser = argparse.ArgumentParser(description="%(prog)s - Update CloudFlare with current IP")
-    parser.add_argument("-c", "--config", help="Config file path.", default="./config.ini", dest="config_file")
+    parser.add_argument("-c", "--config", help="Config file path.", default="/etc/cf-updater/config.ini", dest="config_file")
     parser.add_argument("-d", "--debug", action="store_true", help="Debug logging")
     parser.add_argument("-f", "--foreground", action="store_true", help="Run in foreground")
     parser.add_argument("-v", "--version", action="version", version="%(prog)s version {0}".format(__version__))
