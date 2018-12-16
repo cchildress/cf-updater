@@ -1,0 +1,10 @@
+[Unit]
+Description=CloudFlare DNS updater
+After=network-online.target
+
+[Service]
+Type=forking
+ExecStart=/opt/cf-updater/cf-updater --config /opt/cf-updater/config.ini
+
+[Install]
+WantedBy=multi-user.target
